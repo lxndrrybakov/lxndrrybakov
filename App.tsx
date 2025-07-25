@@ -1,7 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { PVM, PVMStatus, RunRecord, RunRecordType } from './types';
-import { useLocalStorage } from './hooks/useLocalStorage';
-import { BilletCoefficients, INITIAL_PVM_COUNT } from './constants';
+import { BilletCoefficients } from './constants';
+import {
+    getPvms,
+    createPvm,
+    updatePvm,
+    deletePvm,
+    getRuns,
+    createRun,
+    deleteRun,
+} from './services/apiService';
 import Header from './components/Header';
 import Footer from './components/Footer';
 import { MachineGrid } from './components/MachineGrid';
@@ -14,8 +22,8 @@ import { AnalyticsModal } from './components/modals/AnalyticsModal';
 import { ConfirmationModal } from './components/modals/ConfirmationModal';
 
 const App: React.FC = () => {
-    const [pvms, setPvms] = useLocalStorage<PVM[]>('pvms_data', []);
-    const [runs, setRuns] = useLocalStorage<RunRecord[]>('runs_data', []);
+    const [pvms, setPvms] = useState<PVM[]>([]);
+    const [runs, setRuns] = useState<RunRecord[]>([]);
     
     // Modal states
     const [isAddRunModalOpen, setAddRunModalOpen] = useState(false);
@@ -32,114 +40,120 @@ const App: React.FC = () => {
     const [deletePeriod, setDeletePeriod] = useState<'today' | 'week' | 'month' | 'all'>('today');
 
     useEffect(() => {
-        if (pvms.length === 0) {
-            const initialPvms: PVM[] = Array.from({ length: INITIAL_PVM_COUNT }, (_, i) => ({
-                id: Date.now() + i,
-                number: String(i + 1),
-                status: i < 6 ? PVMStatus.InOperation : PVMStatus.InStock,
-                currentMileage: 0,
-                totalMileage: 0,
-                streamId: i < 6 ? i + 1 : undefined,
-            }));
-            setPvms(initialPvms);
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        const loadData = async () => {
+            try {
+                const [pvmsData, runsData] = await Promise.all([getPvms(), getRuns()]);
+                setPvms(pvmsData);
+                setRuns(runsData);
+            } catch (err) {
+                console.error('Failed to load data', err);
+            }
+        };
+        loadData();
     }, []);
 
-    const handleAddRun = (pvmId: number, billetCount: number, billetSize: 130 | 150, scrap: number) => {
+    const handleAddRun = async (pvmId: number, billetCount: number, billetSize: 130 | 150, scrap: number) => {
         const mileage = billetCount * BilletCoefficients[billetSize] - scrap;
         if (mileage < 0) {
             alert("Пробег не может быть отрицательным.");
             return;
         }
 
-        setPvms(prev => prev.map(pvm => 
-            pvm.id === pvmId
-            ? { ...pvm, currentMileage: pvm.currentMileage + mileage, totalMileage: pvm.totalMileage + mileage }
-            : pvm
-        ));
-
         const pvm = pvms.find(p => p.id === pvmId);
-        if (pvm) {
-            const newRun: RunRecord = {
-                id: crypto.randomUUID(),
+        if (!pvm) return;
+
+        try {
+            const newRun: RunRecord = await createRun({
                 pvmId,
                 pvmNumber: pvm.number,
-                date: new Date().toISOString(),
                 billetCount,
                 billetSize,
                 scrap,
                 mileage,
+                date: new Date().toISOString(),
                 type: RunRecordType.Run,
                 streamId: pvm.streamId,
-            };
+                id: crypto.randomUUID(),
+            });
             setRuns(prev => [...prev, newRun]);
+
+            const updatedPvm: PVM = await updatePvm(pvmId, {
+                currentMileage: pvm.currentMileage + mileage,
+                totalMileage: pvm.totalMileage + mileage,
+            });
+            setPvms(prev => prev.map(p => (p.id === updatedPvm.id ? updatedPvm : p)));
+        } catch (err) {
+            console.error('Failed to add run', err);
         }
     };
     
-    const handleMovePVM = (pvmId: number, newStatus: PVMStatus, streamId?: number) => {
+    const handleMovePVM = async (pvmId: number, newStatus: PVMStatus, streamId?: number) => {
         const pvmToMove = pvms.find(p => p.id === pvmId);
-        if(!pvmToMove) return;
+        if (!pvmToMove) return;
 
-        // Create repair record if moving to repair
-        if (newStatus === PVMStatus.InRepair && pvmToMove.currentMileage > 0) {
-            const repairRecord: RunRecord = {
-                id: crypto.randomUUID(),
-                pvmId,
-                pvmNumber: pvmToMove.number,
-                date: new Date().toISOString(),
-                mileage: pvmToMove.currentMileage,
-                type: RunRecordType.Repair,
-                streamId: pvmToMove.streamId,
-            };
-            setRuns(prev => [...prev, repairRecord]);
+        try {
+            // If moving to repair, create repair record
+            if (newStatus === PVMStatus.InRepair && pvmToMove.currentMileage > 0) {
+                const repair = await createRun({
+                    id: crypto.randomUUID(),
+                    pvmId,
+                    pvmNumber: pvmToMove.number,
+                    date: new Date().toISOString(),
+                    mileage: pvmToMove.currentMileage,
+                    type: RunRecordType.Repair,
+                    streamId: pvmToMove.streamId,
+                });
+                setRuns(prev => [...prev, repair]);
+            }
+
+            // PVM occupying target stream should be moved to stock
+            const occupying = pvms.find(p => p.streamId === streamId);
+            if (occupying && occupying.id !== pvmId) {
+                const updated = await updatePvm(occupying.id, { status: PVMStatus.InStock, streamId: undefined });
+                setPvms(prev => prev.map(p => (p.id === updated.id ? updated : p)));
+            }
+
+            const comingFromRepair = pvmToMove.status === PVMStatus.InRepair;
+            const updatedPvm = await updatePvm(pvmId, {
+                status: newStatus,
+                streamId: newStatus === PVMStatus.InOperation ? streamId : undefined,
+                currentMileage: newStatus === PVMStatus.InRepair || comingFromRepair ? 0 : pvmToMove.currentMileage,
+            });
+
+            setPvms(prev => prev.map(p => (p.id === updatedPvm.id ? updatedPvm : p)));
+        } catch (err) {
+            console.error('Failed to move PVM', err);
         }
-
-        setPvms(prev => {
-             // If we are moving a PVM to an already occupied stream, the currently occupying PVM must be moved to stock.
-            const pvmOnTargetStream = prev.find(p => p.streamId === streamId);
-            
-            return prev.map(pvm => {
-                // The PVM we are explicitly moving
-                if (pvm.id === pvmId) {
-                    const comingFromRepair = pvm.status === PVMStatus.InRepair;
-                    return {
-                        ...pvm,
-                        status: newStatus,
-                        streamId: newStatus === PVMStatus.InOperation ? streamId : undefined,
-                        // Reset current mileage when moving TO repair, or when coming FROM repair back to stock/operation
-                        currentMileage: newStatus === PVMStatus.InRepair || comingFromRepair ? 0 : pvm.currentMileage,
-                    };
-                }
-                // The PVM that was on the target stream (if any)
-                if (pvmOnTargetStream && pvm.id === pvmOnTargetStream.id) {
-                    return { ...pvm, status: PVMStatus.InStock, streamId: undefined };
-                }
-                return pvm;
-            })
-        });
     };
 
-    const handleAddPVM = (number: string) => {
+    const handleAddPVM = async (number: string) => {
         if (pvms.some(pvm => pvm.number === number)) {
             alert('ПВМ с таким номером уже существует!');
             return;
         }
-        const newPvm: PVM = {
-            id: Date.now(),
-            number,
-            status: PVMStatus.InStock,
-            currentMileage: 0,
-            totalMileage: 0,
-        };
-        setPvms(prev => [...prev, newPvm]);
+        try {
+            const created: PVM = await createPvm({
+                number,
+                status: PVMStatus.InStock,
+                currentMileage: 0,
+                totalMileage: 0,
+                id: Date.now(),
+            });
+            setPvms(prev => [...prev, created]);
+        } catch (err) {
+            console.error('Failed to add PVM', err);
+        }
     };
 
-    const handleDeletePVM = () => {
-        if (selectedPvm) {
+    const handleDeletePVM = async () => {
+        if (!selectedPvm) return;
+        try {
+            await deletePvm(selectedPvm.id);
             setPvms(pvms.filter(pvm => pvm.id !== selectedPvm.id));
-            setRuns(runs.filter(run => run.pvmId !== selectedPvm.id)); // Also remove associated runs
+            setRuns(runs.filter(run => run.pvmId !== selectedPvm.id));
             setSelectedPvm(null);
+        } catch (err) {
+            console.error('Failed to delete PVM', err);
         }
     };
 
@@ -164,7 +178,7 @@ const App: React.FC = () => {
         });
     };
 
-    const handleDeleteData = (period: 'today' | 'week' | 'month' | 'all') => {
+    const handleDeleteData = async (period: 'today' | 'week' | 'month' | 'all') => {
         let newRuns: RunRecord[];
 
         if (period === 'all') {
@@ -191,9 +205,16 @@ const App: React.FC = () => {
         }
     
         const updatedPvms = recalculateAllPvmsMileage(pvms, newRuns);
-    
-        setRuns(newRuns);
-        setPvms(updatedPvms);
+
+        try {
+            const removed = runs.filter(r => !newRuns.includes(r));
+            await Promise.all(removed.map(r => deleteRun(r.id)));
+            await Promise.all(updatedPvms.map(p => updatePvm(p.id, { currentMileage: p.currentMileage, totalMileage: p.totalMileage })));
+            setRuns(newRuns);
+            setPvms(updatedPvms);
+        } catch (err) {
+            console.error('Failed to delete data', err);
+        }
     };
 
     const openAddRunModal = (pvm: PVM) => { setSelectedPvm(pvm); setAddRunModalOpen(true); };
