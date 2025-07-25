@@ -1,10 +1,14 @@
-- 👋 Hi, I’m @lxndrrybakov
-- 👀 I’m interested in programming and security 
-- 🌱 I’m currently learning Python Development 
-- 💞️ I’m looking to collaborate on any project :) 
-- 📫 How to reach me lxndrrybakov@gmail.com 
+# Run and deploy your AI Studio app
 
-<!---
-lxndrrybakov/lxndrrybakov is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
-You can click the Preview link to take a look at your changes.
---->
+This contains everything you need to run your app locally.
+
+## Run Locally
+
+**Prerequisites:**  Node.js
+
+
+1. Install dependencies:
+   `npm install`
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+3. Run the app:
+   `npm run dev`
